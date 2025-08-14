@@ -30,41 +30,55 @@ const corsOptions = {
     return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
   preflightContinue: false,
   optionsSuccessStatus: 204
 };
 
-// Use cors middleware
+// ---------------------------
+// 1) Request logger (first, so we see OPTIONS/preflight)
+// ---------------------------
+app.use((req, res, next) => {
+  console.log(`[req] ${new Date().toISOString()} ${req.method} ${req.originalUrl} origin=${req.headers.origin || 'no-origin'}`);
+  next();
+});
+
+// ---------------------------
+// 2) Apply CORS middleware
+// ---------------------------
 app.use(cors(corsOptions));
 
-// ALSO: ensure we always set the Access-Control-* headers for every response
-// This guards against cases where some error occurs before cors() set headers
+// ---------------------------
+// 3) Fallback: ensure Access-Control headers are present on EVERY response
+//    (This helps if some error is thrown before cors() can set headers.)
+// ---------------------------
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
-  // Change to 'true' if you need credentials
-  // res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+  // set to 'true' only if you actually use credentials (cookies, auth headers with credentials)
+  res.setHeader('Access-Control-Allow-Credentials', 'false');
+  // expose error header if you need: res.setHeader('Access-Control-Expose-Headers', 'Content-Length');
+  // Debug log for CORS fallback
+  // (You can comment this out in production)
+  console.log('[CORS-FALLBACK] origin=', origin || 'no-origin');
   next();
 });
 
-// Explicitly respond to OPTIONS for all routes (helps serverless / edge cases)
+// ---------------------------
+// 4) Explicitly respond to OPTIONS for all routes (helps serverless / edge cases)
+// ---------------------------
 app.options('*', (req, res) => {
   // If origin allowed, return 204 with the headers set by previous middleware
   res.status(204).end();
 });
 
-// Keep a small request logger to confirm the request reaches the function
-app.use((req, res, next) => {
-  console.log(`[req] ${new Date().toISOString()} ${req.method} ${req.originalUrl} origin=${req.headers.origin || 'no-origin'}`);
-  next();
-});
-
-// Body parsing (we won't parse multipart here)
+// ---------------------------
+// 5) Body parsing (we won't parse multipart here)
+// ---------------------------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -76,6 +90,7 @@ fs.ensureDirSync(uploadsDir);
 fs.ensureDirSync(tmpDirRoot);
 
 // Multer storage (writes to /tmp/...)
+// keep as before
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => cb(null, `${uuidv4()}${path.extname(file.originalname)}`)
@@ -237,9 +252,30 @@ app.post('/generate', upload.single('photo'), async (req, res) => {
   } catch (err) {
     console.error('generate error', err && err.message ? err.message : err);
     await fs.remove(workDir).catch(()=>{});
-    // Make sure we always send JSON so client can parse error
+    // Make sure we always send JSON so client can parse error.
+    // Also ensure CORS header present on error responses:
+    try {
+      const origin = (req && req.headers && req.headers.origin) || null;
+      if (origin && ALLOWED_ORIGINS.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
+    } catch (e) {
+      // ignore
+    }
     res.status(500).json({ error: err.message || 'Server error' });
   }
+});
+
+// Global error handler (catches any uncaught errors in middleware chain)
+app.use((err, req, res, next) => {
+  console.error('Unhandled error middleware:', err && err.stack ? err.stack : err);
+  try {
+    const origin = (req && req.headers && req.headers.origin) || null;
+    if (origin && ALLOWED_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+  } catch (e) { /* ignore */ }
+  res.status(500).json({ error: err && err.message ? err.message : 'Server error' });
 });
 
 // Export for Vercel / local
@@ -249,3 +285,8 @@ if (process.env.VERCEL) {
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }
+
+// Optional: catch unhandled rejections to avoid silent failures
+process.on('unhandledRejection', (reason, p) => {
+  console.error('Unhandled Rejection at:', p, 'reason:', reason);
+});
