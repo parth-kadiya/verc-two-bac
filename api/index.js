@@ -19,21 +19,48 @@ const app = express();
 const ALLOWED_ORIGINS = [
   'http://localhost:3000',
   'https://vercel-frontend-sigma-nine.vercel.app'
+  // If your frontend origin is different, add it here (exact match).
 ];
 
 // === CORS options for cors() middleware ===
 const corsOptions = {
   origin: function (origin, callback) {
-    // allow non-browser tools (no origin)
+    // allow non-browser tools (no origin) — e.g., curl, Postman
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+  allowedHeaders: ['Origin', 'Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
   preflightContinue: false,
-  optionsSuccessStatus: 204
+  optionsSuccessStatus: 204,
+  credentials: false
 };
+
+// ---------------------------
+// 0) Utility: middleware to ALWAYS set CORS headers (fallback + explicit)
+//    Put this very early so OPTIONS and errors get headers.
+// ---------------------------
+function setCorsHeaders(req, res, next) {
+  try {
+    const origin = req.headers.origin;
+    // Only echo origin when it is allowed (avoid wildcard when not desired)
+    if (origin && ALLOWED_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    // Always set these for preflight and normal responses
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Origin,Content-Type,Authorization,Accept,X-Requested-With');
+    // set to 'true' only if you actually use credentials (cookies, etc.)
+    res.setHeader('Access-Control-Allow-Credentials', 'false');
+    // Tell caches that the response varies by Origin
+    res.setHeader('Vary', 'Origin');
+  } catch (e) {
+    // ignore header-setting errors
+    console.warn('setCorsHeaders middleware error', e && e.message ? e.message : e);
+  }
+  next();
+}
 
 // ---------------------------
 // 1) Request logger (first, so we see OPTIONS/preflight)
@@ -44,36 +71,22 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------
-// 2) Apply CORS middleware
+// 2) Early CORS header fallback (always runs)
+// ---------------------------
+app.use(setCorsHeaders);
+
+// ---------------------------
+// 3) Apply CORS middleware (for robust handling and preflight validation)
 // ---------------------------
 app.use(cors(corsOptions));
 
 // ---------------------------
-// 3) Fallback: ensure Access-Control headers are present on EVERY response
-//    (This helps if some error is thrown before cors() can set headers.)
-// ---------------------------
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
-  // set to 'true' only if you actually use credentials (cookies, auth headers with credentials)
-  res.setHeader('Access-Control-Allow-Credentials', 'false');
-  // expose error header if you need: res.setHeader('Access-Control-Expose-Headers', 'Content-Length');
-  // Debug log for CORS fallback
-  // (You can comment this out in production)
-  console.log('[CORS-FALLBACK] origin=', origin || 'no-origin');
-  next();
-});
-
-// ---------------------------
 // 4) Explicitly respond to OPTIONS for all routes (helps serverless / edge cases)
+//    This is placed before body parsers so preflight returns quickly.
 // ---------------------------
 app.options('*', (req, res) => {
-  // If origin allowed, return 204 with the headers set by previous middleware
-  res.status(204).end();
+  // headers have already been set by setCorsHeaders and cors()
+  return res.status(corsOptions.optionsSuccessStatus || 204).end();
 });
 
 // ---------------------------
@@ -90,7 +103,6 @@ fs.ensureDirSync(uploadsDir);
 fs.ensureDirSync(tmpDirRoot);
 
 // Multer storage (writes to /tmp/...)
-// keep as before
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => cb(null, `${uuidv4()}${path.extname(file.originalname)}`)
@@ -237,6 +249,14 @@ app.post('/generate', upload.single('photo'), async (req, res) => {
         })
         .save(outputPath);
     });
+
+    // Ensure CORS header is present just before sending file
+    try {
+      const origin = (req && req.headers && req.headers.origin) || null;
+      if (origin && ALLOWED_ORIGINS.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
+    } catch (e) { /* ignore */ }
 
     // send file
     res.download(outputPath, 'My_Certificate.mp4', async (err) => {
