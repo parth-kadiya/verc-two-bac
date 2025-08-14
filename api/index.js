@@ -15,59 +15,100 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const app = express();
 
-// ✅ CORS setup with your actual frontend URL
-app.use(cors({
-  origin: [
-    'http://localhost:3000', // local dev
-    'https://vercel-frontend-sigma-nine.vercel.app' // your deployed frontend
-  ]
-}));
+// === Allowed origins - exact values ===
+const ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'https://vercel-frontend-sigma-nine.vercel.app'
+];
 
+// === CORS options for cors() middleware ===
+const corsOptions = {
+  origin: function (origin, callback) {
+    // allow non-browser tools (no origin)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  preflightContinue: false,
+  optionsSuccessStatus: 204
+};
+
+// Use cors middleware
+app.use(cors(corsOptions));
+
+// ALSO: ensure we always set the Access-Control-* headers for every response
+// This guards against cases where some error occurs before cors() set headers
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+  // Change to 'true' if you need credentials
+  // res.setHeader('Access-Control-Allow-Credentials', 'true');
+  next();
+});
+
+// Explicitly respond to OPTIONS for all routes (helps serverless / edge cases)
+app.options('*', (req, res) => {
+  // If origin allowed, return 204 with the headers set by previous middleware
+  res.status(204).end();
+});
+
+// Keep a small request logger to confirm the request reaches the function
+app.use((req, res, next) => {
+  console.log(`[req] ${new Date().toISOString()} ${req.method} ${req.originalUrl} origin=${req.headers.origin || 'no-origin'}`);
+  next();
+});
+
+// Body parsing (we won't parse multipart here)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ===== Writable directories for Vercel =====
+// ===== Writable directories for serverless runtime =====
 const RUNTIME_TMP = process.env.TMPDIR || '/tmp';
 const uploadsDir = path.join(RUNTIME_TMP, 'uploads');
 const tmpDirRoot = path.join(RUNTIME_TMP, 'work');
 fs.ensureDirSync(uploadsDir);
 fs.ensureDirSync(tmpDirRoot);
 
-// Multer storage
+// Multer storage (writes to /tmp/...)
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => cb(null, `${uuidv4()}${path.extname(file.originalname)}`)
 });
 const upload = multer({ storage });
 
-// Static bundled file paths
+// Static bundled file paths (include via vercel.json includeFiles)
 const TEMPLATE_VIDEO = path.join(__dirname, '..', 'media', 'certificate_vid_mu.mp4');
 const FONT_FILE = path.join(__dirname, '..', 'media', 'Montserrat-Bold.ttf');
 
 const CANVAS_W = 1240;
 const CANVAS_H = 1748;
-
 function sanitizeForDrawText(s) {
   if (!s) return '';
   return s.replace(/[:"]/g, '');
 }
 
-// Optional: ffmpeg version check
+// Log ffmpeg version (helpful)
 execFile(ffmpegStatic, ['-version'], (err, stdout, stderr) => {
   if (err) {
     console.warn('Could not run ffmpeg -version check', err);
   } else {
-    const outLines = (stdout || '').split('\n').slice(0, 6).join('\n');
-    console.log('ffmpeg -version (top lines):\n' + outLines);
+    const out = (stdout || '').split('\n').slice(0,6).join('\n');
+    console.log('ffmpeg -version (top lines):\n' + out);
     if (/freetype|libfreetype/i.test(stdout + stderr)) {
-      console.log('ffmpeg includes freetype (drawtext should work).');
+      console.log('ffmpeg appears to include freetype (drawtext likely works).');
     } else {
-      console.warn('⚠ ffmpeg may not have freetype — drawtext might fail.');
+      console.warn('⚠ ffmpeg may NOT include freetype (drawtext might fail).');
     }
   }
 });
 
-// ✅ Root route for quick test
+// Simple root health route
 app.get('/', (req, res) => {
   res.send('✅ Backend is running successfully!');
 });
@@ -78,6 +119,8 @@ app.get('/api/status', (req, res) => {
 
 app.post('/generate', upload.single('photo'), async (req, res) => {
   const requestId = uuidv4();
+  console.log(`[${requestId}] POST /generate start`);
+
   const workDir = path.join(tmpDirRoot, requestId);
   await fs.ensureDir(workDir);
 
@@ -87,19 +130,23 @@ app.post('/generate', upload.single('photo'), async (req, res) => {
 
     if (!req.file) {
       await fs.remove(workDir);
+      console.log(`[${requestId}] missing photo`);
       return res.status(400).json({ error: 'Photo is required (field name: photo)' });
     }
     if (!name) {
       await fs.remove(workDir);
+      console.log(`[${requestId}] missing name`);
       return res.status(400).json({ error: 'Name is required' });
     }
 
     if (!await fs.pathExists(TEMPLATE_VIDEO)) {
       await fs.remove(workDir);
+      console.error(`[${requestId}] Template video missing at ${TEMPLATE_VIDEO}`);
       return res.status(500).json({ error: 'Template video missing on server' });
     }
     if (!await fs.pathExists(FONT_FILE)) {
       await fs.remove(workDir);
+      console.error(`[${requestId}] Font file missing at ${FONT_FILE}`);
       return res.status(500).json({ error: 'Font file missing on server' });
     }
 
@@ -134,7 +181,6 @@ app.post('/generate', upload.single('photo'), async (req, res) => {
     const overlayX = 620 - 300;
     const overlayY = 425 - 300;
 
-    // Prepare drawtext
     let fontPathForFF = fontCopyPath.replace(/\\/g, '/');
     const fontPathEscapedForFilter = fontPathForFF.replace(/:/g, '\\:').replace(/'/g, "\\'");
     const safeName = name.replace(/'/g, "\\'");
@@ -165,28 +211,40 @@ app.post('/generate', upload.single('photo'), async (req, res) => {
           '-movflags', '+faststart',
           '-shortest'
         ])
+        .on('stderr', line => { if (line && line.trim()) console.log(`[ffmpeg ${requestId}] ${line}`); })
         .on('error', (err, stdout, stderr) => {
-          reject(new Error(`ffmpeg error: ${stderr || err.message}`));
+          console.error(`[${requestId}] ffmpeg error:`, err && err.message ? err.message : err);
+          reject(new Error(stderr || err.message || 'ffmpeg error'));
         })
-        .on('end', () => resolve())
+        .on('end', () => {
+          console.log(`[${requestId}] ffmpeg finished -> ${outputPath}`);
+          resolve();
+        })
         .save(outputPath);
     });
 
-    res.download(outputPath, 'My_Certificate.mp4', async () => {
-      await fs.remove(workDir);
-      await fs.remove(uploadedPath).catch(() => {});
+    // send file
+    res.download(outputPath, 'My_Certificate.mp4', async (err) => {
+      try { await fs.remove(workDir); } catch (e) { console.warn('cleanup workDir failed', e); }
+      try { if (await fs.pathExists(uploadedPath)) await fs.remove(uploadedPath); } catch(e) { /* ignore */ }
+      if (err) {
+        console.error(`[${requestId}] download error`, err);
+      } else {
+        console.log(`[${requestId}] download served`);
+      }
     });
 
   } catch (err) {
-    console.error('generate error', err);
-    await fs.remove(workDir).catch(() => {});
+    console.error('generate error', err && err.message ? err.message : err);
+    await fs.remove(workDir).catch(()=>{});
+    // Make sure we always send JSON so client can parse error
     res.status(500).json({ error: err.message || 'Server error' });
   }
 });
 
-// ✅ Export for Vercel / Local run
+// Export for Vercel / local
 if (process.env.VERCEL) {
-  module.exports = app; // Vercel handles serverless
+  module.exports = app;
 } else {
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
